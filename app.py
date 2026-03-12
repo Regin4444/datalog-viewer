@@ -44,17 +44,24 @@ def detect_time_column(columns):
 
 
 def load_log(file) -> pd.DataFrame:
-    first_line = file.readline().decode("utf-8", errors="ignore").strip()
-    file.seek(0)
+    filename = file.name.lower()
 
-    if first_line.startswith("#") or "StartTime" in first_line:
-        df = pd.read_csv(file, skiprows=1)
+    if filename.endswith(".csv"):
+        first_line = file.readline().decode("utf-8", errors="ignore").strip()
+        file.seek(0)
+
+        if first_line.startswith("#") or "StartTime" in first_line:
+            df = pd.read_csv(file, skiprows=1)
+        else:
+            df = pd.read_csv(file)
+
+    elif filename.endswith(".xlsx"):
+        df = pd.read_excel(file)
+
     else:
-        df = pd.read_csv(file)
+        raise ValueError("Unsupported file type. Please upload a CSV or XLSX file.")
 
     df.columns = make_unique_columns(df.columns)
-
-    # Common missing / blank placeholders
     df = df.replace(["-", "--", "---", ""], pd.NA)
 
     for col in df.columns:
@@ -128,10 +135,39 @@ def normalize_series(series: pd.Series) -> pd.Series:
     return pd.Series([0] * len(series), index=series.index)
 
 
+def prepare_time_axis(df: pd.DataFrame, x_col: str) -> pd.Series:
+    """
+    Returns a numeric x-axis series.
+    Handles:
+    - numeric elapsed time
+    - datetime strings in a time column
+    - fallback numeric coercion
+    """
+    source = df[x_col]
+
+    # Already numeric
+    if pd.api.types.is_numeric_dtype(source):
+        return pd.to_numeric(source, errors="coerce")
+
+    # Try numeric conversion first in case values are numeric strings
+    numeric_try = pd.to_numeric(source, errors="coerce")
+    if numeric_try.notna().any():
+        return numeric_try
+
+    # Try datetime parsing and convert to elapsed seconds
+    dt_try = pd.to_datetime(source, errors="coerce")
+    if dt_try.notna().any():
+        first_valid = dt_try.dropna().iloc[0]
+        return (dt_try - first_valid).dt.total_seconds()
+
+    # Final fallback
+    return pd.to_numeric(source, errors="coerce")
+
+
 st.title("📈 ECU Datalog Viewer")
 st.caption("Upload a CSV log, group channels, and inspect them in overlay or stacked view.")
 
-uploaded_file = st.file_uploader("Upload CSV log", type=["csv"])
+uploaded_file = st.file_uploader("Upload log file", type=["csv", "xlsx"])
 
 if uploaded_file is None:
     st.info("Upload a CSV log file to begin.")
@@ -155,17 +191,19 @@ if x_col is None:
     st.write("Detected columns:", list(df.columns))
     st.stop()
 
-# Keep numeric columns only
+# Keep numeric columns only for plottable channels
 numeric_df = df.select_dtypes(include=["number"]).copy()
+
+# Build x-axis separately so datetime-like time columns still work
+if x_col in df.columns:
+    numeric_df[x_col] = prepare_time_axis(df, x_col)
 
 # Remove columns with no actual data
 numeric_df = numeric_df.dropna(axis=1, how="all")
 
-# Ensure x-axis column exists in numeric data if possible
-if x_col not in numeric_df.columns and x_col in df.columns:
-    numeric_df[x_col] = pd.to_numeric(df[x_col], errors="coerce")
-
-numeric_df = numeric_df.dropna(axis=1, how="all")
+if x_col not in numeric_df.columns:
+    st.error(f"Could not prepare the time axis from column '{x_col}'.")
+    st.stop()
 
 numeric_cols = numeric_df.columns.tolist()
 y_options_all = [c for c in numeric_cols if c != x_col]
@@ -223,10 +261,13 @@ with st.sidebar:
     if not default_for_group and filtered_options:
         default_for_group = filtered_options[:min(4, len(filtered_options))]
 
+    file_key = f"channels_{uploaded_file.name}"
+
     selected_cols = st.multiselect(
         "Channels",
         options=filtered_options,
         default=default_for_group,
+        key=file_key,
     )
 
     st.divider()
@@ -271,9 +312,20 @@ if show_ignored and removed_empty_cols:
     with st.expander("Ignored empty numeric channels", expanded=True):
         st.write(removed_empty_cols)
 
-if not selected_cols:
-    st.warning("Select at least one channel from the sidebar.")
+valid_selected_cols = [col for col in selected_cols if col in numeric_df.columns]
+missing_selected_cols = [col for col in selected_cols if col not in numeric_df.columns]
+
+if missing_selected_cols:
+    st.warning(
+        "Some previously selected channels are not available in this log and were removed: "
+        + ", ".join(missing_selected_cols)
+    )
+
+if not valid_selected_cols:
+    st.warning("Select at least one valid channel from the sidebar.")
     st.stop()
+
+selected_cols = valid_selected_cols
 
 plot_df = numeric_df[[x_col] + selected_cols].copy()
 plot_df = plot_df.sort_values(by=x_col)
