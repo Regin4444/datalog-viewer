@@ -62,6 +62,8 @@ def load_log(file) -> pd.DataFrame:
         raise ValueError("Unsupported file type. Please upload a CSV or XLSX file.")
 
     df.columns = make_unique_columns(df.columns)
+
+    # Common missing / blank placeholders
     df = df.replace(["-", "--", "---", ""], pd.NA)
 
     for col in df.columns:
@@ -136,245 +138,67 @@ def normalize_series(series: pd.Series) -> pd.Series:
 
 
 def prepare_time_axis(df: pd.DataFrame, x_col: str) -> pd.Series:
-    """
-    Returns a numeric x-axis series.
-    Handles:
-    - numeric elapsed time
-    - datetime strings in a time column
-    - fallback numeric coercion
-    """
     source = df[x_col]
 
-    # Already numeric
     if pd.api.types.is_numeric_dtype(source):
         return pd.to_numeric(source, errors="coerce")
 
-    # Try numeric conversion first in case values are numeric strings
     numeric_try = pd.to_numeric(source, errors="coerce")
     if numeric_try.notna().any():
         return numeric_try
 
-    # Try datetime parsing and convert to elapsed seconds
     dt_try = pd.to_datetime(source, errors="coerce")
     if dt_try.notna().any():
         first_valid = dt_try.dropna().iloc[0]
         return (dt_try - first_valid).dt.total_seconds()
 
-    # Final fallback
     return pd.to_numeric(source, errors="coerce")
 
 
-st.title("📈 ECU Datalog Viewer")
-st.caption("Upload a CSV log, group channels, and inspect them in overlay or stacked view.")
+def prepare_log_data(df: pd.DataFrame, file_name: str):
+    if df.empty:
+        raise ValueError(f"{file_name}: file is empty")
 
-uploaded_file = st.file_uploader("Upload log file", type=["csv", "xlsx"])
-
-if uploaded_file is None:
-    st.info("Upload a CSV log file to begin.")
-    st.stop()
-
-try:
-    df = load_log(uploaded_file)
-except Exception as e:
-    st.error(f"Failed to read file: {e}")
-    st.stop()
-
-if df.empty:
-    st.error("The uploaded file appears to be empty.")
-    st.stop()
-
-x_col = detect_time_column(df.columns)
-
-if x_col is None:
-    st.error("Could not find a time column in this file.")
-    st.write("Accepted time columns: `Time (sec)` or `timestamp`")
-    st.write("Detected columns:", list(df.columns))
-    st.stop()
-
-# Keep numeric columns only for plottable channels
-numeric_df = df.select_dtypes(include=["number"]).copy()
-
-# Build x-axis separately so datetime-like time columns still work
-if x_col in df.columns:
-    numeric_df[x_col] = prepare_time_axis(df, x_col)
-
-# Remove columns with no actual data
-numeric_df = numeric_df.dropna(axis=1, how="all")
-
-if x_col not in numeric_df.columns:
-    st.error(f"Could not prepare the time axis from column '{x_col}'.")
-    st.stop()
-
-numeric_cols = numeric_df.columns.tolist()
-y_options_all = [c for c in numeric_cols if c != x_col]
-
-if not y_options_all:
-    st.error("No numeric columns with usable data were found to plot.")
-    st.stop()
-
-group_map = build_group_map(y_options_all)
-group_names = ["All"] + list(group_map.keys())
-
-preferred_defaults = [
-    "Engine RPM (RPM)",
-    "Engine speed",
-    "Boost (psi)",
-    "Boost pressure",
-    "Boost pressure (2)",
-    "Lambda (AFR)",
-    "Lambda (AFR) setpoint",
-    "A/F Commanded",
-    "Ignition advance",
-    "Throttle valve position",
-]
-
-default_cols = [c for c in preferred_defaults if c in y_options_all][:4]
-if not default_cols:
-    default_cols = y_options_all[:4]
-
-all_numeric_original = df.select_dtypes(include=["number"]).columns.tolist()
-removed_empty_cols = sorted(list(set(all_numeric_original) - set(numeric_cols)))
-
-with st.sidebar:
-    st.header("Controls")
-
-    view_mode = st.radio("View mode", ["Overlay", "Stacked"], index=0)
-
-    selected_group = st.selectbox("Channel group", group_names, index=0)
-
-    if selected_group == "All":
-        available_options = y_options_all
-    else:
-        available_options = group_map.get(selected_group, [])
-
-    search_text = st.text_input("Search channels", placeholder="e.g. boost, lambda, rpm")
-
-    if search_text:
-        filtered_options = [
-            c for c in available_options
-            if search_text.lower() in c.lower()
-        ]
-    else:
-        filtered_options = available_options
-
-    default_for_group = [c for c in default_cols if c in filtered_options]
-    if not default_for_group and filtered_options:
-        default_for_group = filtered_options[:min(4, len(filtered_options))]
-
-    file_key = f"channels_{uploaded_file.name}"
-
-    selected_cols = st.multiselect(
-        "Channels",
-        options=filtered_options,
-        default=default_for_group,
-        key=file_key,
-    )
-
-    st.divider()
-
-    normalize_overlay = False
-    if view_mode == "Overlay":
-        normalize_overlay = st.checkbox("Normalize overlay channels", value=True)
-
-    line_width = st.slider("Line width", 1, 5, 2, 1)
-
-    if view_mode == "Stacked":
-        chart_height_per_row = st.slider("Height per chart", 180, 400, 240, 10)
-    else:
-        chart_height_per_row = 240
-
-    show_preview = st.checkbox("Show data preview", value=False)
-    show_groups = st.checkbox("Show detected groups", value=False)
-    show_columns = st.checkbox("Show detected columns", value=False)
-    show_ignored = st.checkbox("Show ignored empty channels", value=False)
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Rows", len(df))
-c2.metric("Usable channels", len(y_options_all))
-c3.metric("Selected", len(selected_cols))
-c4.metric("Time axis", x_col)
-
-if show_preview:
-    st.subheader("Preview")
-    st.dataframe(df.head(20), use_container_width=True)
-
-if show_groups:
-    with st.expander("Detected channel groups", expanded=True):
-        for group_name, cols in group_map.items():
-            st.markdown(f"**{group_name}** ({len(cols)})")
-            st.write(cols)
-
-if show_columns:
-    with st.expander("Detected usable numeric columns", expanded=True):
-        st.write(y_options_all)
-
-if show_ignored and removed_empty_cols:
-    with st.expander("Ignored empty numeric channels", expanded=True):
-        st.write(removed_empty_cols)
-
-valid_selected_cols = [col for col in selected_cols if col in numeric_df.columns]
-missing_selected_cols = [col for col in selected_cols if col not in numeric_df.columns]
-
-if missing_selected_cols:
-    st.warning(
-        "Some previously selected channels are not available in this log and were removed: "
-        + ", ".join(missing_selected_cols)
-    )
-
-if not valid_selected_cols:
-    st.warning("Select at least one valid channel from the sidebar.")
-    st.stop()
-
-selected_cols = valid_selected_cols
-
-plot_df = numeric_df[[x_col] + selected_cols].copy()
-plot_df = plot_df.sort_values(by=x_col)
-
-if view_mode == "Stacked":
-    num_rows = len(selected_cols)
-
-    fig = make_subplots(
-        rows=num_rows,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.02,
-        subplot_titles=selected_cols
-    )
-
-    for i, col in enumerate(selected_cols, start=1):
-        fig.add_trace(
-            go.Scatter(
-                x=plot_df[x_col],
-                y=plot_df[col],
-                mode="lines",
-                name=col,
-                line={"width": line_width},
-                hovertemplate=(
-                    f"<b>{col}</b><br>"
-                    f"{x_col}: %{{x}}<br>"
-                    f"Value: %{{y}}<extra></extra>"
-                ),
-            ),
-            row=i,
-            col=1
+    x_col = detect_time_column(df.columns)
+    if x_col is None:
+        raise ValueError(
+            f"{file_name}: could not find a time column. "
+            "Accepted time columns: Time (sec), timestamp"
         )
 
-        fig.update_yaxes(title_text=col, row=i, col=1)
+    numeric_df = df.select_dtypes(include=["number"]).copy()
 
-    total_height = max(350, num_rows * chart_height_per_row)
+    if x_col in df.columns:
+        numeric_df[x_col] = prepare_time_axis(df, x_col)
 
-    fig.update_layout(
-        height=total_height,
-        title="Stacked Channel View",
-        hovermode="x unified",
-        showlegend=False,
-        margin=dict(l=70, r=30, t=60, b=50),
-    )
+    numeric_df = numeric_df.dropna(axis=1, how="all")
 
-    fig.update_xaxes(title_text=x_col, row=num_rows, col=1)
+    if x_col not in numeric_df.columns:
+        raise ValueError(f"{file_name}: could not prepare the time axis from '{x_col}'")
 
-else:
+    numeric_cols = numeric_df.columns.tolist()
+    y_options_all = [c for c in numeric_cols if c != x_col]
+
+    if not y_options_all:
+        raise ValueError(f"{file_name}: no numeric columns with usable data were found")
+
+    group_map = build_group_map(y_options_all)
+    removed_empty_cols = sorted(list(set(df.select_dtypes(include=["number"]).columns.tolist()) - set(numeric_cols)))
+
+    return {
+        "file_name": file_name,
+        "df": df,
+        "numeric_df": numeric_df,
+        "x_col": x_col,
+        "y_options_all": y_options_all,
+        "group_map": group_map,
+        "removed_empty_cols": removed_empty_cols,
+    }
+
+
+def build_overlay_figure(plot_df, x_col, selected_cols, line_width, normalize_overlay, title, ui_revision_key):
     fig = go.Figure()
+    y_title = "Value"
 
     for col in selected_cols:
         actual_y = plot_df[col]
@@ -404,8 +228,8 @@ else:
         )
 
     fig.update_layout(
-        height=max(500, chart_height_per_row * 2),
-        title="Overlay Channel View",
+        height=500,
+        title=title,
         hovermode="x unified",
         margin=dict(l=70, r=30, t=60, b=50),
         yaxis_title=y_title,
@@ -417,6 +241,253 @@ else:
             xanchor="left",
             x=0,
         ),
+        uirevision=ui_revision_key,
+    )
+    return fig
+
+
+def build_stacked_figure(plot_df, x_col, selected_cols, line_width, chart_height_per_row, title, ui_revision_key):
+    num_rows = len(selected_cols)
+
+    fig = make_subplots(
+        rows=num_rows,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        subplot_titles=selected_cols
     )
 
-st.plotly_chart(fig, use_container_width=True)
+    for i, col in enumerate(selected_cols, start=1):
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df[x_col],
+                y=plot_df[col],
+                mode="lines",
+                name=col,
+                line={"width": line_width},
+                hovertemplate=(
+                    f"<b>{col}</b><br>"
+                    f"{x_col}: %{{x}}<br>"
+                    f"Value: %{{y}}<extra></extra>"
+                ),
+            ),
+            row=i,
+            col=1
+        )
+        fig.update_yaxes(title_text=col, row=i, col=1)
+
+    total_height = max(350, num_rows * chart_height_per_row)
+
+    fig.update_layout(
+        height=total_height,
+        title=title,
+        hovermode="x unified",
+        showlegend=False,
+        margin=dict(l=70, r=30, t=60, b=50),
+        uirevision=ui_revision_key,
+    )
+
+    fig.update_xaxes(title_text=x_col, row=num_rows, col=1)
+    return fig
+
+
+st.title("📈 ECU Datalog Viewer")
+st.caption("Upload up to 2 CSV or XLSX logs, then compare them in stacked graphs.")
+
+uploaded_files = st.file_uploader(
+    "Upload 1 or 2 log files",
+    type=["csv", "xlsx"],
+    accept_multiple_files=True
+)
+
+if not uploaded_files:
+    st.info("Upload 1 or 2 CSV/XLSX log files to begin.")
+    st.stop()
+
+if len(uploaded_files) > 2:
+    st.warning("Please upload a maximum of 2 files.")
+    st.stop()
+
+logs = []
+load_errors = []
+
+for uploaded_file in uploaded_files:
+    try:
+        df = load_log(uploaded_file)
+        log_data = prepare_log_data(df, uploaded_file.name)
+        logs.append(log_data)
+    except Exception as e:
+        load_errors.append(f"{uploaded_file.name}: {e}")
+
+if load_errors:
+    for err in load_errors:
+        st.error(err)
+
+if not logs:
+    st.stop()
+
+# Build common channel list across uploaded files
+common_channels = set(logs[0]["y_options_all"])
+for log in logs[1:]:
+    common_channels &= set(log["y_options_all"])
+
+common_channels = sorted(common_channels)
+all_channels_union = sorted(set().union(*[set(log["y_options_all"]) for log in logs]))
+group_map_common = build_group_map(common_channels) if common_channels else {}
+group_names = ["All Common", "All Available"] + sorted(group_map_common.keys())
+
+preferred_defaults = [
+    "Engine RPM (RPM)",
+    "Engine speed",
+    "Boost (psi)",
+    "Boost pressure",
+    "Boost pressure (2)",
+    "Lambda (AFR)",
+    "Lambda (AFR) setpoint",
+    "A/F Commanded",
+    "Ignition advance",
+    "Throttle valve position",
+]
+
+default_cols = [c for c in preferred_defaults if c in common_channels][:4]
+if not default_cols:
+    default_cols = common_channels[:4] if common_channels else all_channels_union[:4]
+
+with st.sidebar:
+    st.header("Controls")
+
+    view_mode = st.radio("View mode", ["Overlay", "Stacked"], index=0)
+
+    selected_group = st.selectbox("Channel group", group_names, index=0)
+
+    if selected_group == "All Common":
+        available_options = common_channels
+    elif selected_group == "All Available":
+        available_options = all_channels_union
+    else:
+        available_options = group_map_common.get(selected_group, [])
+
+    search_text = st.text_input("Search channels", placeholder="e.g. boost, lambda, rpm")
+
+    if search_text:
+        filtered_options = [
+            c for c in available_options
+            if search_text.lower() in c.lower()
+        ]
+    else:
+        filtered_options = available_options
+
+    default_for_group = [c for c in default_cols if c in filtered_options]
+    if not default_for_group and filtered_options:
+        default_for_group = filtered_options[:min(4, len(filtered_options))]
+
+    combined_names = "_".join(sorted([log["file_name"] for log in logs]))
+    file_key = f"channels_{combined_names}"
+
+    selected_cols = st.multiselect(
+        "Channels",
+        options=filtered_options,
+        default=default_for_group,
+        key=file_key,
+        help="Choose channels to plot. If a channel is missing from one file, it will be skipped for that graph."
+    )
+
+    st.divider()
+
+    normalize_overlay = False
+    if view_mode == "Overlay":
+        normalize_overlay = st.checkbox("Normalize overlay channels", value=True)
+
+    line_width = st.slider("Line width", 1, 5, 2, 1)
+
+    if view_mode == "Stacked":
+        chart_height_per_row = st.slider("Height per chart", 180, 400, 240, 10)
+    else:
+        chart_height_per_row = 240
+
+    show_preview = st.checkbox("Show data preview", value=False)
+    show_groups = st.checkbox("Show detected common groups", value=False)
+    show_columns = st.checkbox("Show common channels", value=False)
+    show_ignored = st.checkbox("Show ignored empty channels", value=False)
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Files loaded", len(logs))
+m2.metric("Common channels", len(common_channels))
+m3.metric("Selected", len(selected_cols))
+m4.metric("View", view_mode)
+
+if show_groups and group_map_common:
+    with st.expander("Detected common channel groups", expanded=True):
+        for group_name, cols in group_map_common.items():
+            st.markdown(f"**{group_name}** ({len(cols)})")
+            st.write(cols)
+
+if show_columns:
+    with st.expander("Common channels", expanded=True):
+        st.write(common_channels)
+
+if show_ignored:
+    with st.expander("Ignored empty numeric channels", expanded=True):
+        for log in logs:
+            st.markdown(f"**{log['file_name']}**")
+            st.write(log["removed_empty_cols"] if log["removed_empty_cols"] else ["None"])
+
+if not selected_cols:
+    st.warning("Select at least one channel from the sidebar.")
+    st.stop()
+
+for idx, log in enumerate(logs, start=1):
+    file_name = log["file_name"]
+    x_col = log["x_col"]
+    numeric_df = log["numeric_df"]
+
+    valid_selected_cols = [col for col in selected_cols if col in numeric_df.columns]
+    missing_selected_cols = [col for col in selected_cols if col not in numeric_df.columns]
+
+    st.subheader(f"Log {idx}: {file_name}")
+
+    info1, info2, info3 = st.columns(3)
+    info1.metric("Rows", len(log["df"]))
+    info2.metric("Usable channels", len(log["y_options_all"]))
+    info3.metric("Time axis", x_col)
+
+    if missing_selected_cols:
+        st.warning(
+            f"{file_name}: these selected channels are not available and were skipped: "
+            + ", ".join(missing_selected_cols)
+        )
+
+    if show_preview:
+        st.dataframe(log["df"].head(20), use_container_width=True)
+
+    if not valid_selected_cols:
+        st.info(f"{file_name}: no valid selected channels available to plot.")
+        continue
+
+    plot_df = numeric_df[[x_col] + valid_selected_cols].copy()
+    plot_df = plot_df.sort_values(by=x_col)
+
+    ui_revision_key = f"{file_name}_{x_col}_{view_mode}"
+
+    if view_mode == "Stacked":
+        fig = build_stacked_figure(
+            plot_df=plot_df,
+            x_col=x_col,
+            selected_cols=valid_selected_cols,
+            line_width=line_width,
+            chart_height_per_row=chart_height_per_row,
+            title=f"Stacked Channel View — {file_name}",
+            ui_revision_key=ui_revision_key,
+        )
+    else:
+        fig = build_overlay_figure(
+            plot_df=plot_df,
+            x_col=x_col,
+            selected_cols=valid_selected_cols,
+            line_width=line_width,
+            normalize_overlay=normalize_overlay,
+            title=f"Overlay Channel View — {file_name}",
+            ui_revision_key=ui_revision_key,
+        )
+
+    st.plotly_chart(fig, use_container_width=True)
